@@ -1,10 +1,9 @@
-import AWS from 'aws-sdk';
-import csv from 'csv-parser';
-import { Parser } from 'json2csv';
+const csv = require('csv-parser');
+const { Parser } = require("json2csv");
+const { S3Client, GetObjectCommand, PutObjectCommand, CopyObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const s3Client = new S3Client({ region: "us-west-1" });
 
-const s3 = new AWS.S3();
-
-export async function processEvents(event) {
+async function processEvents(event) {
   const bucket = event.Records[0].s3.bucket.name;
   const fileName = decodeURIComponent(event.Records[0].s3.object.key.replace(/\+/g, ' '));
 
@@ -30,25 +29,29 @@ export async function processEvents(event) {
   }
 }
 
-export function isS3PutEvent(event) {
+function isS3PutEvent(event) {
   if (
     event.Records &&
     event.Records.length > 0 &&
     event.Records[0].eventSource === "aws:s3" &&
     event.Records[0].eventName === "ObjectCreated:Put"
+    && event.Records[0].s3.object.key.includes('unprocessed')
   ) {
     return true;
   }
   return false;
 }
 
-function processCSV(bucket, fileName) {
+async function processCSV(bucket, fileName) {
+  const command = new GetObjectCommand({ Bucket: bucket, Key: fileName });
+  const response = await s3Client.send(command);
+  if (!response.Body) {
+    throw new Error(`No body found in response for file: ${fileName}`);
+  }
+
   return new Promise((resolve, reject) => {
     const results = [];
-
-    s3.getObject({ Bucket: bucket, Key: fileName })
-      .createReadStream()
-      .pipe(csv())
+    response.Body.pipe(csv())
       .on('data', (data) => results.push(data))
       .on('error', reject)
       .on('end', () => resolve(results));
@@ -56,48 +59,43 @@ function processCSV(bucket, fileName) {
 }
 
 function processRows(rows) {
+  console.log("Processing rows...");
+  let successCount = 0;
+  let failureCount = 0;
 
-    console.log("Processing rows...");
-    let successCount = 0;
-    let failureCount = 0;
-
-    
-    let row;
-    const errors = [];
-    for (let i = 0; i < rows.length; i++) {
-      try {
-        row = rows[i];
-        //console.log(`Processing row ${i + 1}: ${row.model}, ${row.year}`);
-        // Simulate processing logic
-        throw new Error("Simulated processing error");
-        successCount++;
-      } catch (error) {
-        failureCount++;
-        errors.push(row);
-        console.error(`Error processing row ${i + 1}:`, error);
-      }
+  const errors = [];
+  for (let i = 0; i < rows.length; i++) {
+    try {
+      const row = rows[i];
+      // Simulate processing logic
+      successCount++;
+    } catch (error) {
+      failureCount++;
+      errors.push(rows[i]);
+      console.error(`Error processing row ${i + 1}:`, error);
     }
+  }
 
-    return {
-      successCount,
-      failureCount,
-      errors
-    };
+  return {
+    successCount,
+    failureCount,
+    errors,
+  };
 }
 
 async function copyFileToProcessed(bucket, fileName) {
-
   const sourceKey = fileName.startsWith('unprocessed/') ? fileName : `unprocessed/${fileName}`;
   const destinationKey = sourceKey.replace('unprocessed/', 'processed/').replace(/\.csv$/, '_processed.csv');
 
   try {
     console.log(`Copying file from ${sourceKey} to ${destinationKey} in bucket ${bucket}...`);
 
-    await s3.copyObject({
+    const command = new CopyObjectCommand({
       Bucket: bucket,
       CopySource: `${bucket}/${sourceKey}`,
       Key: destinationKey,
-    }).promise();
+    });
+    await s3Client.send(command);
 
     console.log(`File successfully copied to ${destinationKey}`);
   } catch (error) {
@@ -112,10 +110,8 @@ async function deleteFile(bucket, fileName) {
   try {
     console.log(`Deleting file: ${key} from bucket: ${bucket}...`);
 
-    await s3.deleteObject({
-      Bucket: bucket,
-      Key: key,
-    }).promise();
+    const command = new DeleteObjectCommand({ Bucket: bucket, Key: key });
+    await s3Client.send(command);
 
     console.log(`File successfully deleted: ${key}`);
   } catch (error) {
@@ -129,17 +125,17 @@ async function writeErrorFileToS3(bucket, fileName, errorData) {
   const destinationKey = sourceKey.replace('unprocessed/', 'errors/').replace(/\.csv$/, '_errors.csv');
 
   try {
-    
     console.log(`Writing error file to ${destinationKey} in bucket ${bucket}...`);
     const json2csvParser = new Parser();
     const csvData = json2csvParser.parse(errorData);
 
-    await s3.putObject({
+    const command = new PutObjectCommand({
       Bucket: bucket,
       Key: destinationKey,
       Body: csvData,
       ContentType: 'text/csv',
-    }).promise();
+    });
+    await s3Client.send(command);
 
     console.log(`Error file successfully written to ${destinationKey}`);
   } catch (error) {
@@ -147,3 +143,5 @@ async function writeErrorFileToS3(bucket, fileName, errorData) {
     throw error;
   }
 }
+
+module.exports = { processEvents, isS3PutEvent };
